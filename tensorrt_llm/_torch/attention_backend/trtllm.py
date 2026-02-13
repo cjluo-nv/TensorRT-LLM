@@ -249,8 +249,11 @@ class TrtllmAttentionWrapper:
             kv_scale_quant_orig (torch.Tensor): The tensor to store the scaling factor for dequantization from INT8/FP8 in the KV cache, with shape (1) on GPU.
             out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
             out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
-            kv_scales_sf (torch.Tensor): The tensor to store the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
-            kv_scales_sf_inv (torch.Tensor): The tensor to store the inverse of the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
+            kv_scales_sf (torch.Tensor): Optional KV scale override tensor carrying K/V scales.
+                Expected shape is (2) as [k_scale, v_scale], or (3) as [1.0, k_scale, v_scale].
+                In FP8 KV cache mode, a scalar kernel scale is derived from max(k_scale, v_scale).
+            kv_scales_sf_inv (torch.Tensor): Optional inverse KV scale override tensor carrying inverse K/V scales.
+                Expected shape is (2) as [inv_k_scale, inv_v_scale], or (3) as [1.0, inv_k_scale, inv_v_scale].
             use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
@@ -1628,8 +1631,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             output_sf (Optional[torch.Tensor]): Output scale factor tensor for NVFP4.
             out_scale (Optional[torch.Tensor]): Scale factor tensor for quantizing output.
             out_scale_sf (Optional[torch.Tensor]): Global scale factor tensor for NVFP4 for quantizingoutput.
-            kv_scales_sf (Optional[torch.Tensor]): KV scale factor tensor.
-            kv_scales_sf_inv (Optional[torch.Tensor]): KV scale factor inverse tensor.
+            kv_scales_sf (Optional[torch.Tensor]): KV scale override tensor carrying K/V scales.
+                Expected shape is (2) as [k_scale, v_scale], or (3) as [1.0, k_scale, v_scale].
+                In FP8 KV cache mode, a scalar kernel scale is derived from max(k_scale, v_scale).
+            kv_scales_sf_inv (Optional[torch.Tensor]): Inverse KV scale override tensor carrying inverse K/V scales.
+                Expected shape is (2) as [inv_k_scale, inv_v_scale], or (3) as [1.0, inv_k_scale, inv_v_scale].
             attention_mask (AttentionMask): Attention mask.
             attention_input_type (AttentionInputType): Attention input type.
             latent_cache (Optional[torch.Tensor]): Latent cache tensor.
@@ -1696,6 +1702,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
 
+        resolved_kv_scale_orig_quant, resolved_kv_scale_quant_orig, resolved_kv_scales_sf, resolved_kv_scales_sf_inv = self._resolve_kv_scales_for_mode(
+            self.has_fp8_kv_cache, self.has_fp4_kv_cache,
+            self.kv_scale_orig_quant, self.kv_scale_quant_orig, kv_scales_sf,
+            kv_scales_sf_inv)
+
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,
@@ -1720,12 +1731,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             workspace=metadata.workspace
             if not metadata.is_cuda_graph else metadata.cuda_graph_workspace,
             cache_indirection=metadata.cache_indirection,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
+            kv_scale_orig_quant=resolved_kv_scale_orig_quant,
+            kv_scale_quant_orig=resolved_kv_scale_quant_orig,
             out_scale=out_scale,
             out_scale_sf=out_scale_sf,
-            kv_scales_sf=kv_scales_sf,
-            kv_scales_sf_inv=kv_scales_sf_inv,
+            kv_scales_sf=resolved_kv_scales_sf,
+            kv_scales_sf_inv=resolved_kv_scales_sf_inv,
             use_nvfp4_output=output_sf
             is not None,  # NVFP4 output will setup output_sf tensor
             use_paged_context_fmha=use_paged_context_fmha,
@@ -1784,6 +1795,56 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         else:
             return output, output_sf
 
+    @staticmethod
+    def _resolve_kv_scales_for_mode(
+        has_fp8_kv_cache: bool,
+        has_fp4_kv_cache: bool,
+        kv_scale_orig_quant: torch.Tensor,
+        kv_scale_quant_orig: torch.Tensor,
+        kv_scales_sf: Optional[torch.Tensor],
+        kv_scales_sf_inv: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        if kv_scales_sf is None and kv_scales_sf_inv is None:
+            return kv_scale_orig_quant, kv_scale_quant_orig, None, None
+        if kv_scales_sf is None or kv_scales_sf_inv is None:
+            mode = "FP8" if has_fp8_kv_cache else "NVFP4"
+            raise ValueError(
+                f"{mode} KV cache expects both kv_scales_sf and kv_scales_sf_inv."
+            )
+
+        n = kv_scales_sf.numel()
+        if n != kv_scales_sf_inv.numel():
+            raise ValueError(
+                "kv_scales_sf and kv_scales_sf_inv must have the same shape.")
+
+        if has_fp8_kv_cache:
+            if n == 1:
+                return kv_scales_sf_inv, kv_scales_sf, None, None
+            if n == 2:
+                max_scale = torch.max(kv_scales_sf[0], kv_scales_sf[1]).reshape(1)
+                return torch.reciprocal(max_scale), max_scale, None, None
+            if n == 3:
+                max_scale = torch.max(kv_scales_sf[1], kv_scales_sf[2]).reshape(1)
+                return torch.reciprocal(max_scale), max_scale, None, None
+            raise ValueError(
+                "FP8 KV cache expects kv_scales_sf/kv_scales_sf_inv to have shape (1), "
+                "shape (2) as [k_scale, v_scale], or shape (3) as [1.0, k_scale, v_scale]."
+            )
+
+        if has_fp4_kv_cache:
+            if n == 2:
+                return kv_scale_orig_quant, kv_scale_quant_orig, kv_scales_sf, kv_scales_sf_inv
+            if n == 3:
+                return kv_scale_orig_quant, kv_scale_quant_orig, kv_scales_sf[
+                    1:], kv_scales_sf_inv[1:]
+            raise ValueError(
+                "NVFP4 KV cache expects kv_scales_sf/kv_scales_sf_inv to have shape (2), "
+                "or shape (3) as [1.0, k_scale, v_scale]."
+            )
+
+        return kv_scale_orig_quant, kv_scale_quant_orig, None, None
+
     @classmethod
     def support_fused_rope(cls) -> bool:
         return True
@@ -1828,6 +1889,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sink_token_length = 0
         beam_width = 1
+        kv_scales_sf = kwargs.get("kv_scales_sf")
+        kv_scales_sf_inv = kwargs.get("kv_scales_sf_inv")
+        resolved_kv_scale_orig_quant, resolved_kv_scale_quant_orig, _, _ = self._resolve_kv_scales_for_mode(
+            self.has_fp8_kv_cache, self.has_fp4_kv_cache,
+            self.kv_scale_orig_quant, self.kv_scale_quant_orig, kv_scales_sf,
+            kv_scales_sf_inv)
 
         compressed_kv, k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
             out_dtype,
@@ -1838,8 +1905,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
+            resolved_kv_scale_orig_quant,
+            resolved_kv_scale_quant_orig,
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
@@ -1912,6 +1979,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sink_token_length = 0
         beam_width = 1
+        kv_scales_sf = kwargs.get("kv_scales_sf")
+        kv_scales_sf_inv = kwargs.get("kv_scales_sf_inv")
+        resolved_kv_scale_orig_quant, resolved_kv_scale_quant_orig, _, _ = self._resolve_kv_scales_for_mode(
+            self.has_fp8_kv_cache, self.has_fp4_kv_cache,
+            self.kv_scale_orig_quant, self.kv_scale_quant_orig, kv_scales_sf,
+            kv_scales_sf_inv)
 
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
             q,
@@ -1928,8 +2001,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
+            resolved_kv_scale_orig_quant,
+            resolved_kv_scale_quant_orig,
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,

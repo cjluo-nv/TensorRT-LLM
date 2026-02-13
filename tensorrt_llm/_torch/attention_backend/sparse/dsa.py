@@ -1690,6 +1690,12 @@ class DSATrtllmAttention(TrtllmAttention):
 
         sink_token_length = 0
         beam_width = 1
+        kv_scales_sf = kwargs.get("kv_scales_sf")
+        kv_scales_sf_inv = kwargs.get("kv_scales_sf_inv")
+        resolved_kv_scale_orig_quant, resolved_kv_scale_quant_orig, _, _ = self._resolve_kv_scales_for_mode(
+            self.has_fp8_kv_cache, self.has_fp4_kv_cache,
+            self.kv_scale_orig_quant, self.kv_scale_quant_orig, kv_scales_sf,
+            kv_scales_sf_inv)
 
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
             q,
@@ -1706,8 +1712,8 @@ class DSATrtllmAttention(TrtllmAttention):
             block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
+            resolved_kv_scale_orig_quant,
+            resolved_kv_scale_quant_orig,
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
